@@ -1,0 +1,26 @@
+# --- Never commit real financial data ---------------------------------------
+*.pdf
+*.xlsx
+*.xls
+*.csv
+*.json
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.heic
+# Allowed exceptions: fictional demo statements and README screenshots
+!samples/DEMO_*.pdf
+!docs/screenshots/*.png
+# Local data / environments
+category_overrides.json
+dist/
+venv/
+.venv/
+__pycache__/
+*.pyc
+install.log
+.DS_Store
+Thumbs.db
+.env
+*.log
