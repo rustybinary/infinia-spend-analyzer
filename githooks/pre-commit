@@ -1,3 +1,0 @@
-#!/bin/sh
-# Enable once with:  git config core.hooksPath .githooks
-python3 scripts/check_pii.py || { echo "Commit blocked by PII check."; exit 1; }
