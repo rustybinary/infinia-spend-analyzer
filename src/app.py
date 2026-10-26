@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Infinia Spend Analyzer - local-only web app. Binds to 127.0.0.1; nothing leaves your computer.
 PDF bytes and the password are handled in memory only and never written to disk."""
+import base64
 import io
 import os
 import re
@@ -269,8 +270,34 @@ def first_name(n):
     return parts[0].title() if parts else n.title()
 
 
+NAME_LINE = re.compile(r"^[A-Za-z][A-Za-z.']*(?: [A-Za-z][A-Za-z.']*){0,4}$")   # words and initials only, e.g. "ANITA K R"
+NOT_A_NAME = {"date", "time", "description", "transaction", "transactions", "rewards", "amount", "total", "domestic",
+              "international", "payment", "payments", "offers", "card", "statement", "balance", "debit", "credit",
+              "details", "particulars", "emi", "sr", "no", "programs", "bonus", "points", "summary", "convert",
+              "eligible", "pi", "page", "your", "on", "the", "of", "and", "to", "for"}
+
+
+def is_name_heading(lines, i):
+    """A line that is only a person's name (any case, initials allowed, no CKYC tag needed) sitting directly above a
+    transaction row that has its own description. Column titles and labels are excluded by word list."""
+    line = lines[i].strip()
+    if len(line) > 45 or not NAME_LINE.match(line) or i + 1 >= len(lines):
+        return False
+    words = line.lower().replace(".", "").split()
+    if any(w in NOT_A_NAME for w in words) or any(k in line.lower() for k in CREDIT_HINTS):
+        return False
+    nxt = PIPE_RE.match(lines[i + 1])
+    return bool(nxt and nxt.group("desc").strip().rstrip("+").strip())
+
+
+class Rows(list):
+    """List of parsed rows that also remembers lines that looked like transactions but could not be read."""
+    unparsed = None
+
+
 def extract(pdf, source):
-    rows, holder = [], None   # None = no cardholder heading seen yet
+    rows, holder = Rows(), None   # None = no cardholder heading seen yet
+    rows.unparsed = []
     for page in pdf.pages:
         plines = page_lines(page)
         lines = [t for t, _ in plines]
@@ -278,6 +305,12 @@ def extract(pdf, source):
             h = HOLDER_RE.match(line)
             if h:
                 holder = first_name(h.group("n").strip())
+                continue
+            if is_name_heading(lines, i):
+                holder = first_name(line.strip())
+                continue
+            if re.search(r"TRANSACTIONS\s+TOTAL\s+AMOUNT", line):
+                holder = None   # end of this statement's transaction list: the next list starts with the main cardholder
                 continue
             m = PIPE_RE.match(line)
             if m:  # HDFC-style: "DD/MM/YYYY| HH:MM  DESC  [+ pts]  C amount"
@@ -290,6 +323,7 @@ def extract(pdf, source):
                 text_credit = sign_credit or any(k in desc.lower() for k in CREDIT_HINTS)
                 if desc.upper().startswith("EMI "):   # badge text = "eligible to convert to EMI", not an EMI
                     desc = desc[4:].strip()
+                desc = re.sub(r"\s+-\s*\d+\s*$", "", desc)   # reversed reward points printed as "- 5"
                 desc, city = split_city(desc)
                 rows.append({"Date": dt, "Description": desc, "City": city, "Amount": amt,
                              "Base Pts": int(m.group("pts")) if m.group("pts") else 0,
@@ -298,6 +332,8 @@ def extract(pdf, source):
                 continue
             m = LINE_RE.match(line)  # generic fallback: "DD/MM/YYYY  DESC  amount [CR]"
             if not m:
+                if re.match(r"^\s*\d{1,2}/\d{1,2}/\d{4}\s*\|", line):
+                    rows.unparsed.append(line.strip()[:80])
                 continue
             dt = parse_date(m.group(1))
             if not dt:
@@ -340,40 +376,92 @@ def statement_date(filename, txns):
     return max((t["Date"] for t in txns), default=datetime.now()).strftime("%Y-%m-%d")
 
 
+MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+
+
+def segment_date(base, progs):
+    """Normally the statement date is the one in the file name. If a file holds several statements, a later summary
+    names programmes from a later month, so move that summary's date to the same day in that month."""
+    latest = None
+    for p in progs:
+        m = re.search(r"_([A-Za-z]{3})(\d{2})(?:_|$)", p["raw"])
+        if m and m.group(1).lower() in MONTHS:
+            key = (2000 + int(m.group(2)), MONTHS.index(m.group(1).lower()) + 1)
+            latest = max(latest, key) if latest else key
+    if latest and latest > (int(base[:4]), int(base[5:7])):
+        return f"{latest[0]}-{latest[1]:02d}-{base[8:10]}"
+    return base
+
+
 def extract_rewards(pdf, source, txns):
-    """Reads the 'Rewards Program Points Summary' table: programme rows + total."""
-    sdate, progs, total, inside = statement_date(source, txns), [], None, False
+    """Reads each 'Rewards Program Points Summary' table: programme rows + total. Returns (programmes, totals)."""
+    base = statement_date(source, txns)
+    segs, cur, inside = [], None, False
     for page in pdf.pages:
         for line in (page.extract_text() or "").splitlines():
             if REWARD_HDR.search(line):
                 inside = True
+                if cur is None:
+                    cur = {"progs": [], "total": None}
                 continue
             if not inside:
                 continue
             m = PROG_RE.match(line)
             if m:
-                progs.append({"statement": sdate, "source": source,
-                              "program": m.group("prog").replace("_", " ").strip(),
-                              "points": int(m.group("pts").replace(",", ""))})
+                cur["progs"].append({"raw": m.group("prog"), "program": m.group("prog").replace("_", " ").strip(),
+                                     "points": int(m.group("pts").replace(",", ""))})
                 continue
             m = TOTAL_RE.match(line)
             if m:
-                total = int(m.group("pts").replace(",", ""))
-                inside = False
+                cur["total"] = int(m.group("pts").replace(",", ""))
+                segs.append(cur); cur, inside = None, False
             elif re.match(r"^\s*Important Information", line):
                 inside = False
-    if not progs and total is None:
-        return [], None
-    return progs, {"statement": sdate, "source": source,
-                   "total": total if total is not None else sum(p["points"] for p in progs),
-                   "calc_total": sum(p["points"] for p in progs)}
+    if cur and cur["progs"]:
+        segs.append(cur)
+    progs, totals = [], []
+    for s in segs:
+        if not s["progs"] and s["total"] is None:
+            continue
+        sd = segment_date(base, s["progs"])
+        for p in s["progs"]:
+            progs.append({"statement": sd, "source": source, "program": p["program"], "points": p["points"]})
+        calc = sum(p["points"] for p in s["progs"])
+        totals.append({"statement": sd, "source": source, "total": s["total"] if s["total"] is not None else calc, "calc_total": calc})
+    return progs, totals
+
+
+@app.errorhandler(Exception)
+def json_errors(e):
+    from werkzeug.exceptions import HTTPException
+    code = e.code if isinstance(e, HTTPException) else 500
+    print("Error while handling a request:", repr(e))   # shown only in the app's own window, never saved
+    return jsonify({"error": f"The app hit a problem ({type(e).__name__}). Please tell the author which statement it was."}), code
 
 
 @app.route("/process", methods=["POST"])
 def process():
-    password = request.form.get("password", "")
+    class _Upload:   # a file that arrived as base64 inside a JSON body
+        def __init__(self, name, raw):
+            self.filename, self._raw = name, raw
+
+        def read(self):
+            return self._raw
+
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        password = str(body.get("password", ""))
+        uploads = []
+        for item in body.get("files", []):
+            try:
+                uploads.append(_Upload(str(item.get("name", "statement.pdf")), base64.b64decode(item.get("data", ""))))
+            except Exception:
+                pass
+    else:
+        password = request.form.get("password", "")
+        uploads = request.files.getlist("pdfs")
     log, rows, rewards, totals, lead_names = [], [], [], [], []
-    for f in request.files.getlist("pdfs"):
+    for f in uploads:
         data, pdf = f.read(), None
         for pw in (password, ""):
             try:
@@ -387,20 +475,22 @@ def process():
             continue
         with pdf:
             r = extract(pdf, f.filename)
-            progs, tot = extract_rewards(pdf, f.filename, r)
+            progs, tots = extract_rewards(pdf, f.filename, r)
         if r and r[0].get("Cardholder"):
             lead_names.append(r[0]["Cardholder"])   # heading appeared before the first transaction => that's the main cardholder
         rows += r
         rewards += progs
-        if tot:
-            totals.append(tot)
+        totals += tots
         flagged = sum(1 for x in r if x.get("Check"))
         msg = f"{len(r)} transactions" if r else "Opened, but no transactions matched - layout may need a custom pattern"
         if progs:
             msg += f", {len(progs)} reward programmes"
         if flagged:
             msg += f" - {flagged} marked 'Review' (colour and text disagree about credit/debit)"
-        log.append({"file": f.filename, "status": ("warn" if (flagged or not r) else "ok"), "msg": msg})
+        unread = list(getattr(r, "unparsed", []) or [])
+        if unread:
+            msg += f" - WARNING: {len(unread)} line(s) start with a date but could not be read, e.g. “{unread[0]}”"
+        log.append({"file": f.filename, "status": ("warn" if (flagged or unread or not r) else "ok"), "msg": msg, "_rows": r})
     password = None
 
     if not rows:
@@ -411,6 +501,11 @@ def process():
     for x in rows:
         if not x.get("Cardholder"):
             x["Cardholder"] = primary   # transactions printed before any heading belong to the main cardholder
+    for entry in log:   # statement check: who got how many transactions from each file
+        fr = entry.pop("_rows", None)
+        if fr:
+            cnt = Counter(x["Cardholder"] for x in fr)
+            entry["msg"] += " · by cardholder: " + ", ".join(f"{k} {v}" for k, v in cnt.most_common())
     df = pd.DataFrame(rows)
     # drop overlaps between different statements, but keep genuine repeats within one statement
     df["_n"] = df.groupby(["Date", "Description", "Amount", "Source"]).cumcount()
@@ -461,6 +556,19 @@ def override():
     return jsonify({"ok": True})
 
 
+@app.route("/reassign", methods=["POST"])
+def reassign():
+    """Move one transaction to another cardholder (for this session only)."""
+    body = request.get_json(force=True)
+    name = first_name(str(body.get("holder", "")).strip())[:30]
+    res = RESULTS.get(body.get("token"))
+    if res is None or not name:
+        return "Bad request", 400
+    df = res["df"]
+    df.loc[df["id"] == body.get("id"), "Cardholder"] = name
+    return jsonify({"ok": True, "holder": name})
+
+
 @app.route("/export", methods=["POST"])
 def export():
     body = request.get_json(force=True)
@@ -494,7 +602,7 @@ def export():
 @app.route("/ping")
 def ping():
     LAST_PING["t"] = time.time()
-    return "ok"
+    return "ok-infinia"
 
 
 @app.route("/quit", methods=["POST"])

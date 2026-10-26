@@ -82,6 +82,7 @@ a.lnk{color:var(--acc);cursor:pointer;text-decoration:underline}
 #menu .hd:hover{background:none}
 .sbar{display:flex;height:100%;border-radius:6px;overflow:hidden}.sbar b{display:block;height:100%}
 .hb.sel{outline:2px solid var(--acc);outline-offset:3px;border-radius:6px;background:var(--acc-soft)}
+.hchip{cursor:pointer;border-bottom:1px dashed var(--mut)}.hchip:hover{color:var(--acc);border-color:var(--acc)}
 .dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:7px}
 .lg{display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px;margin:0 0 8px;color:var(--mut)}.lg span{display:inline-flex;align-items:center}
 .btn:disabled:hover{border-color:var(--line);color:var(--ink)}
@@ -103,6 +104,7 @@ a.lnk{color:var(--acc);cursor:pointer;text-decoration:underline}
   <div id="log"></div>
 </details>
 
+<div id="noapp" class="msg error" style="display:none;margin:14px 0"></div>
 <div id="app" hidden>
   <div class="card fcard" style="margin-top:14px">
     <div class="frow">
@@ -146,7 +148,10 @@ const S={rg:null,data:null,f:{...DEF_F},sort:{k:'date',asc:false},group:true,col
 function usedCats(){const m={};S.data.rows.forEach(x=>{m[x.cat]=(m[x.cat]||0)+1});return m}
 function colorFor(c){if(!S.catColor[c]){S.catColor[c]=c==='GyFTR'?'var(--gy)':NEEDS.includes(c)?'var(--c0)':c==='Payments / Refunds'?'var(--pos)':PAL[Object.keys(S.catColor).length%PAL.length]}return S.catColor[c]}
 
-setInterval(()=>fetch('/ping'),5000);fetch('/ping');
+const NOAPP='This page can’t reach the Infinia Spend Analyzer program, so it can’t read statements. Don’t open page.html on its own or in a preview pane. Start the app instead: on Mac open “Infinia Spend Analyzer”, on Windows double-click “Start-Infinia-Spend-Analyzer.bat” (or run “python src/app.py”), and use the browser tab it opens.';
+async function checkApp(){try{const r=await fetch('/ping');const t=await r.text();if(!r.ok||t.trim()!=='ok-infinia')throw 0;$('#noapp').style.display='none';$('#go').title=''}
+  catch(e){$('#noapp').style.display='block';$('#noapp').textContent=NOAPP}}
+setInterval(()=>fetch('/ping').catch(()=>{}),5000);checkApp();
 function quitApp(){fetch('/quit',{method:'POST'}).finally(()=>{document.body.innerHTML='<p style="padding:40px;font:16px sans-serif">Infinia Spend Analyzer closed. You can close this tab.</p>'})}
 
 /* ---------- upload ---------- */
@@ -157,10 +162,21 @@ $('#drop').onclick=()=>$('#file').click();$('#file').onchange=e=>setFiles(e.targ
 $('#drop').addEventListener('drop',e=>setFiles(e.dataTransfer.files));
 function setFiles(fl){files=[...fl].filter(f=>f.name.toLowerCase().endsWith('.pdf'));
   $('#names').textContent=files.length?files.length+' PDF(s): '+files.map(f=>f.name).join(', '):'';$('#go').disabled=!files.length}
+/* Normal upload uses multipart FormData. Some embedded/preview browsers can't pass FormData through (DataCloneError),
+   so on any failure we retry once with the files sent as plain JSON (base64). Same server, same local connection. */
+async function sendFiles(pw){
+  try{const fd=new FormData();files.forEach(f=>fd.append('pdfs',f));fd.append('password',pw);
+    return await readJson(await fetch('/process',{method:'POST',body:fd}))}
+  catch(first){
+    const items=[];for(const f of files){const b=new Uint8Array(await f.arrayBuffer());let s='';
+      for(let i=0;i<b.length;i+=0x8000)s+=String.fromCharCode.apply(null,b.subarray(i,i+0x8000));items.push({name:f.name,data:btoa(s)})}
+    return await readJson(await fetch('/process',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,files:items})}))}
+}
+async function readJson(r){const t=await r.text();try{return JSON.parse(t)}catch(e){
+  throw new Error(t.trim().startsWith('<')?NOAPP:('Unexpected reply from the app (HTTP '+r.status+').'))}}
 $('#go').onclick=async()=>{
-  const fd=new FormData();files.forEach(f=>fd.append('pdfs',f));fd.append('password',$('#pw').value);
   $('#go').disabled=true;$('#go').textContent='Working…';
-  try{load(await (await fetch('/process',{method:'POST',body:fd})).json())}catch(e){$('#log').innerHTML='<div class="msg error">'+esc(e)+'</div>'}
+  try{const d=await sendFiles($('#pw').value);if(d&&d.error&&!d.log)throw new Error(d.error);load(d)}catch(e){$('#log').innerHTML='<div class="msg error">'+esc(e.message||e)+'</div>';$('#up').open=true}
   $('#go').disabled=!files.length;$('#go').textContent='Sort transactions';$('#pw').value='';
 };
 function load(r){
@@ -232,6 +248,21 @@ function openMenu(ev,desc){
     `<div onclick="${hid(()=>{m.style.display='none';const n=(prompt('New category name')||'').trim();if(n)setCat(desc,n)})}"><b>＋ New category…</b></div>`;
   m.style.display='block';const r=ev.currentTarget.getBoundingClientRect(),hh=m.offsetHeight;
   m.style.left=Math.min(r.left,innerWidth-250)+'px';m.style.top=(r.bottom+hh+8>innerHeight?Math.max(8,r.top-hh-6):r.bottom+6)+'px';
+}
+async function openHolderMenu(ev,id){
+  ev.stopPropagation();const m=$('#menu'),row=S.data.rows.find(x=>x.id===id);if(!row)return;
+  const item=h=>`<div onclick="${hid(()=>{m.style.display='none';setHolder(id,h)})}"><i style="background:var(--c6)"></i>${esc(h)}${h===row.holder?' ✓':''}</div>`;
+  m.innerHTML=`<div class="hd">Cardholder for this transaction</div>`+S.holders.map(item).join('')+
+    `<div onclick="${hid(()=>{m.style.display='none';const n=(prompt('Cardholder first name')||'').trim();if(n)setHolder(id,n)})}"><b>＋ Someone else…</b></div>`;
+  m.style.display='block';const r=ev.currentTarget.getBoundingClientRect(),hh=m.offsetHeight;
+  m.style.left=Math.min(r.left,innerWidth-250)+'px';m.style.top=(r.bottom+hh+8>innerHeight?Math.max(8,r.top-hh-6):r.bottom+6)+'px';
+}
+async function setHolder(id,name){
+  name=name.trim().split(/\s+/)[0];name=name.charAt(0).toUpperCase()+name.slice(1).toLowerCase();if(!name)return;
+  const row=S.data.rows.find(x=>x.id===id);if(!row)return;row.holder=name;
+  S.holders=[...new Set(S.data.rows.map(x=>x.holder))];if(S.f.holder!=='ALL'&&!S.holders.includes(S.f.holder))S.f.holder='ALL';
+  syncFilters();render();
+  try{await fetch('/reassign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:S.data.token,id,holder:name})})}catch(e){}
 }
 async function setCat(desc,cat){
   if(!S.cats.includes(cat))S.cats.splice(S.cats.length-1,0,cat);
@@ -317,7 +348,7 @@ function setSort(v){const [k,d]=v.split('-');S.sort={k,asc:d==='asc'};if(k!=='da
 function sortBy(k){S.sort.asc=S.sort.k===k?!S.sort.asc:(k==='date'||k==='amt'?false:true);S.sort.k=k;render()}
 function txRow(x){return `<tr><td style="white-space:nowrap">${dlabel(x.date)}<div class="city">${esc(x.time)}</div></td>
   <td>${esc(x.desc)}${x.check?'<span class="badge" style="background:#fde8c8;color:#9a5b00" title="Colour and text disagree about credit/debit">Review</span>':''}<div class="city">${esc(x.city)}</div></td>
-  <td>${chip(x.cat,hid(e=>openMenu(e,x.desc)))}</td><td>${esc(x.holder)}</td>
+  <td>${chip(x.cat,hid(e=>openMenu(e,x.desc)))}</td><td><span class="hchip" title="Click to change cardholder" onclick="${hid(e=>openHolderMenu(e,x.id))}">${esc(x.holder)}</span></td>
   <td class="n ${x.type==='Credit'?'cr':''}">${x.type==='Credit'?'+':''}${inr2(Math.abs(x.amt))}</td><td class="n">${x.pts||''}</td></tr>`}
 function tx(a){
   const sorted=sortRows(a),st=stats(a),H=(k,l,c)=>`<th class="${c||''}" onclick="sortBy('${k}')">${l}${S.sort.k===k?(S.sort.asc?' ▲':' ▼'):''}</th>`;
